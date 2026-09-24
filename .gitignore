@@ -4,3 +4,157 @@ __pycache__/
 *.db
 ui/node_modules/
 ui/dist/
+
+Build a repo called `sre-agent`: an SRE incident-triage agent. MCP servers expose ServiceNow, Datadog,
+Kibana/Elasticsearch and GitLab; a FastAPI agent-api acts as MCP client + LLM tool-calling loop and
+streams progress over SSE to a React UI. The same MCP servers are also used from VS Code Copilot Chat.
+Everything must run in MOCK mode with no credentials. Work in the phases below; after each phase, stop,
+list files created, and give me the command to verify it. Do not skip phases or stub files.
+
+## Constraints (apply everywhere)
+- Python 3.11+. Use the official `mcp` Python SDK pinned `mcp>=1.9,<2` (v2 renamed FastMCP; don't use v2 APIs).
+  Server: `from mcp.server.fastmcp import FastMCP`. Client: `from mcp import ClientSession`,
+  `from mcp.client.streamable_http import streamablehttp_client`.
+- Also add `constraints.txt` (pip freeze of tested versions) next to each requirements.txt; Dockerfiles use `-c constraints.txt`.
+- No secrets in the repo. `.env` is gitignored; ship `.env.example` with empty values.
+- Tools named `action_*` are WRITE tools. They must never be offered to the LLM, and must refuse to run
+  inside the MCP server unless `ENABLE_ACTIONS=true`.
+- Containers run as non-root. TLS verification on; optional `CA_BUNDLE` env for a corporate CA.
+
+## Phase 1: config + shared MCP code
+- `config/services.yaml`: map of services. Each has display_name, snow_ci, gitlab_project (path or id),
+  gitlab_environment, kibana_index, kibana_service_field, datadog_service, datadog_env, owners.
+  Seed with payments-api, login-service, statement-batch.
+- `.env.example` with: MOCK=true, LLM_PROVIDER=mock (mock|openai|azure|anthropic), MOCK_STEP_DELAY=1.2,
+  LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, AZURE_API_VERSION=2024-10-21, LLM_TIMEOUT=90, LLM_MAX_TOKENS=2000,
+  MCP_AUTH_TOKEN=, AGENT_MAX_STEPS=10, TOOL_RESULT_MAX_CHARS=6000, ENABLE_ACTIONS=false,
+  REQUIRE_USER_HEADER=false, WEBHOOK_SECRET= (empty = webhook disabled), AUTO_TRIAGE_PRIORITIES=1,2,
+  SNOW_URL/SNOW_TOKEN/SNOW_USER/SNOW_PASSWORD, DD_SITE/DD_API_KEY/DD_APP_KEY,
+  ES_URL/ES_API_KEY/ES_USER/ES_PASSWORD/KIBANA_URL/ES_LEVEL_FIELD=log.level/ES_ERROR_TYPE_FIELD=error.type/
+  ES_MESSAGE_FIELD=message, GITLAB_URL/GITLAB_TOKEN, CA_BUNDLE.
+- `mcp_servers/sre_mcp/common.py`:
+  - MOCK flag; ALLOW_WRITES from ENABLE_ACTIONS; `require_writes()` raises PermissionError when off.
+  - `valid_number(n)`: uppercase, must match `^[A-Z]{2,5}\d{4,12}$` (blocks ServiceNow `^OR`/`^NQ` query injection).
+  - `service_map()` (lru_cache, path from SERVICE_MAP_PATH or ../../config/services.yaml) and
+    `resolve_service(name)` matching key, snow_ci, datadog_service or display_name case-insensitively.
+  - `http_client(base_url, headers, auth)` returning httpx.Client with timeout and CA_BUNDLE verify.
+  - `redact(text)`: mask card numbers (regex `\b\d(?:[ -]?\d){12,18}\b` + Luhn check), SSNs, emails,
+    `Bearer <token>`, and `password|secret|api_key|token|authorization` = or : values.
+  - `clean(obj, max_items=50, max_str=800)`: recursive redact + truncate strings and lists with a marker.
+  - `run(mcp, default_port)`: argparse `--transport stdio|http --host --port`. stdio → `mcp.run()`.
+    http → `app = mcp.streamable_http_app()`, wrap in a small ASGI middleware requiring
+    `Authorization: Bearer $MCP_AUTH_TOKEN` (hmac.compare_digest, 401 otherwise) when the token is set,
+    then `uvicorn.run(app, ...)`. Warn if no token and binding non-localhost.
+- `mcp_servers/sre_mcp/mocks.py`: one coherent scenario anchored to "now" (payments-api bad deploy):
+  INC0048213 (P2, payments-api 5xx, opened 25 min ago) + two lower-priority incidents; change CHG0031102;
+  Datadog monitors in Alert/Warn ~28 min ago; error_rate 0.3% → 18.4% after 30 min ago; Kibana signatures
+  ConnectionPoolTimeoutException ×2311 and UpstreamTimeout; sample logs containing a fake card 4111 1111 1111 1111
+  and an example.com email (to prove redaction); error histogram jumping 30 min ago; GitLab deploy v2.18.0
+  31 min ago containing MR !4412 "Tune DB pool for new ledger client" whose diff changes db.pool.maxSize 50 → 10;
+  previous deploy v2.17.3. Other services return empty data.
+Verify: python -c tests of redact() and resolve_service().
+
+## Phase 2: the four MCP servers (each `FastMCP(name, stateless_http=True)`, every tool takes `service`
+and resolves via resolve_service, returns clean(...), has a mock branch, and a clear docstring for the LLM)
+- `servicenow.py` (port 8101), Table API with sysparm_display_value=true, bearer or basic auth:
+  get_incident(number) incl. mapped `service`; list_open_incidents(max_priority=3, limit=25, capped 100);
+  list_changes(service, hours=24) on cmdb_ci.name + gs.hoursAgoStart; related_incidents(service, days=14);
+  action_add_work_note(number, note): require_writes(), valid_number, PATCH work_notes.
+- `datadog.py` (8102), headers DD-API-KEY/DD-APPLICATION-KEY: get_active_monitors(service) (Alert/Warn/No Data);
+  query_metric(service, metric, minutes=120) using NAMED templates only (error_rate, request_rate,
+  latency_p95, pod_restarts, cpu, memory) returning ≤30 points + min/max/last/baseline(first quarter avg);
+  get_events(service, minutes=240).
+- `kibana.py` (8103), query Elasticsearch `_search` directly (ApiKey or basic): top_error_signatures
+  (terms agg on error type with first/last seen + 1 sample, plus a Kibana Discover URL);
+  search_errors(service, minutes, query=None, limit≤50, minutes ≤1440) where query_string is capped to 200
+  chars with allow_leading_wildcard=false; error_histogram(service, minutes, interval) returning buckets and
+  `estimated_onset` (first bucket > max(10, 5× median)). Never return raw hit dumps.
+- `gitlab.py` (8104), PRIVATE-TOKEN, project path URL-encoded: list_deployments(service, hours) with the MRs
+  in each deploy (commits/:sha/merge_requests); get_merge_request_changes(service, mr_iid) (diffs, fallback
+  /changes, max_str 1500); list_failed_pipelines; compare_refs (refs must match `^[A-Za-z0-9._/-]{1,100}$`);
+  action_create_rollback_mr(service, mr_iid, reason): require_writes(), create branch from default,
+  revert merge/squash commit onto it, open a "Draft: Revert !iid" MR. Never merge.
+- `mcp_servers/Dockerfile` (python:3.12-slim, USER 10001, SERVICE_MAP_PATH=/config/services.yaml).
+Verify: run each with `python -m sre_mcp.<name> --transport http --port <p>` and MOCK=true.
+
+## Phase 3: agent-api (FastAPI)
+- `app/config.py`: all env above; MCP URLs SERVICENOW_MCP_URL etc. defaulting to http://localhost:810x/mcp.
+- `app/mcp_hub.py`: async context manager connecting to all servers via AsyncExitStack (send the bearer
+  token if MCP_AUTH_TOKEN set); unreachable servers are recorded, not fatal. `llm_tools()` returns
+  OpenAI function schemas named `<server>__<tool>`, EXCLUDING action_* tools. `call(name, args,
+  allow_actions=False)` returns (server, tool, ok, text, duration_ms), refusing action_* unless allowed;
+  prefer structuredContent (unwrap {"result": ...}) else text content.
+- `app/llm.py`: internal OpenAI-style messages. Providers: openai-compatible ({base}/chat/completions,
+  Bearer), azure ({base}/openai/deployments/{model}/chat/completions?api-version, api-key header),
+  anthropic ({base}/v1/messages; convert system, tool_use, tool_result blocks), and mock.
+  Mock: sleeps MOCK_STEP_DELAY, then plays the playbook as parallel tool-call batches based on how many
+  tool rounds happened: [get_incident] → [get_active_monitors, query_metric error_rate] →
+  [error_histogram, top_error_signatures] → [list_deployments, list_changes] → [get_merge_request_changes
+  if a deploy had an MR]; then returns an RCA JSON built from the actual tool results (high confidence if
+  deploy + error signature + MR found, else low).
+- `app/prompts.py`: system prompt with that playbook, "only state facts from tool results", confidence rules,
+  and a strict JSON output contract: summary, probable_cause, confidence (high|medium|low), service,
+  timeline[{time, source, event}], evidence[{source, finding, ref}], recommended_actions[{type
+  rollback|work_note|investigate|scale|other, action, details, mr_iid?, service?}], open_questions[].
+- `app/store.py`: SQLite (runs, events, audit), parameterized SQL, thread lock. `emit(run_id, type, data)`
+  persists with a per-run seq (reload MAX(seq) after restart) and pushes to in-memory subscriber queues.
+- `app/agent.py`: run_triage emits run_started, sources, llm_step, agent_note, tool_started, tool_finished
+  (with preview + truncated result), rca_ready, run_finished / run_failed. Tool calls in a round run with
+  asyncio.gather. After AGENT_MAX_STEPS force a final answer without tools. Parse RCA JSON (strip fences,
+  fill defaults); retry once if invalid.
+- `app/main.py` routes: GET /api/health, /api/sources (no internal URLs or error text), /api/incidents
+  (ServiceNow list + latest run per incident), POST /api/triage {incident matching ^[A-Za-z]{2,5}\d{4,12}$},
+  GET /api/runs, /api/runs/{id}, /api/runs/{id}/events (SSE: replay stored events honoring Last-Event-ID,
+  then live, keepalive every 15s, stop at terminal event, header X-Accel-Buffering: no),
+  POST /api/runs/{id}/actions {action: post_work_note|draft_rollback_mr, confirm: true},
+  GET /api/audit, POST /api/webhooks/servicenow.
+  Security rules: identity ONLY from X-Forwarded-User (no other header); write actions ALWAYS require a
+  named user even if REQUIRE_USER_HEADER=false; actions need ENABLE_ACTIONS=true and confirm=true and are
+  written to the audit table. For rollback, the mr_iid from the RCA must appear in a GitLab tool result
+  from the same run, otherwise 400. Webhook requires X-Webhook-Secret (compare_digest; empty secret =
+  disabled), validates the number pattern, and triggers only for AUTO_TRIAGE_PRIORITIES.
+- `agent_api/Dockerfile` (non-root, /data volume), `tests/test_agent.py` with pytest-asyncio
+  (RCA parsing, redaction, truncation, service aliases, mock LLM plays the playbook).
+Verify: start the 4 servers + `uvicorn app.main:app --port 8080`, POST /api/triage for INC0048213,
+curl the SSE stream, confirm status triaged with high confidence.
+
+## Phase 4: React UI (Vite, plain JS, no UI framework)
+- Layout: top bar (brand, per-source health dots, "Demo mode" when mock); left rail of open incidents
+  (priority chip, number, description, status "Not triaged / Triaging / Triaged, high confidence", age);
+  main area: incident header + "Run triage / Run again" button + elapsed time; thin progress bar;
+  four source lanes (ServiceNow, Datadog, Kibana, GitLab) showing Queued/Connected/Querying/Reported/
+  Failed/Unreachable/Not needed and query counts; a correlated timeline with one swimlane per source,
+  numbered markers positioned by time, axis ticks, and a numbered list below; then two columns: agent
+  activity feed (source, tool(args), duration, one-line preview, click to expand pretty JSON) and the RCA
+  panel (confidence badge, summary, probable cause, evidence with https-only links, recommended steps,
+  open questions, buttons "Post RCA to ServiceNow" and "Draft rollback MR (!iid)").
+- Actions open a native <dialog> confirm that names the exact target (incident, or MR !iid in service),
+  says it is audit-logged, then POSTs; show the result or the API error inline.
+- `hooks/useTriageStream.js`: EventSource with a listener per event type feeding a reducer; close on
+  run_finished/run_failed. Selecting an incident with a previous run replays that run.
+- Visual direction: "control room". Cool paper background, white panels, ink navy text, one steel-blue
+  accent; each source keeps a fixed colour everywhere (servicenow green, datadog violet, kibana teal,
+  gitlab burnt orange). IBM Plex Sans for UI, IBM Plex Mono only for tool calls/ids/times. 24h times.
+  Dark mode via prefers-color-scheme. Only ambient motion: a pulse on running lanes; respect
+  prefers-reduced-motion. Responsive: rail stacks on top under 860px, lanes go 2×2.
+- `vite.config.js` proxies /api to API_URL or localhost:8080. `nginx.conf` for the container:
+  serves the SPA, proxies /api to agent-api:8080 with proxy_buffering off and 1h read timeout for SSE,
+  and OVERWRITES identity: `proxy_set_header X-Forwarded-User "";` with a commented oauth2-proxy
+  auth_request block that sets it from $upstream_http_x_auth_request_user. Multi-stage Dockerfile to
+  nginx-unprivileged on 8080.
+Verify: npm run dev, run triage on INC0048213, watch lanes/feed update live, confirm dialog shows !4412.
+
+## Phase 5: wiring, VS Code, docs
+- `docker-compose.yml`: 4 MCP services from one image (different module commands), agent-api, ui.
+  ALL ports bound to 127.0.0.1 (UI on 127.0.0.1:3000). env_file .env. config mounted read-only.
+- `.vscode/mcp.json`: the 4 HTTP servers with `Authorization: Bearer ${input:mcp_token}` and a password
+  promptString input.
+- `AGENTS.md` (rules: never call action_* without approval; use service names) and
+  `.agents/skills/sre-triage/SKILL.md` (frontmatter name/description + the same playbook and output order).
+- `Makefile` (up, down, logs, install, dev, test, smoke), `scripts/dev.sh` (start everything locally, kill all
+  on Ctrl+C), `scripts/smoke.sh` (health, sources, triage INC0048213, print event types and final RCA summary;
+  use heredoc'd python, no nested-quote f-strings), `.gitignore` (.env, .venv, *.db, node_modules, dist).
+- `README.md` (architecture diagram, quick start, going live checklist) and `docs/configuration.md`,
+  `docs/security.md` (read-only agent, gated writes, redaction, identity, MCP token, input validation,
+  pinned deps, production notes), `docs/extending.md` (add a tool, add Kubernetes/Azure as a source).
+Verify: `docker compose up --build`, open http://localhost:3000, triage INC0048213; `make test`; `make smoke`.
