@@ -1,0 +1,55 @@
+# docker compose up --build   ->  UI on http://localhost:3000
+# Defaults run fully in mock mode (no credentials). Edit .env to go live.
+x-mcp: &mcp
+  build: ./mcp_servers
+  env_file: .env
+  environment:
+    SERVICE_MAP_PATH: /config/services.yaml
+  volumes:
+    - ./config:/config:ro
+  restart: unless-stopped
+
+services:
+  servicenow-mcp:
+    <<: *mcp
+    command: ["python", "-m", "sre_mcp.servicenow", "--transport", "http", "--port", "8101"]
+    ports: ["127.0.0.1:8101:8101"]   # exposed locally so VS Code Copilot can use the same servers
+
+  datadog-mcp:
+    <<: *mcp
+    command: ["python", "-m", "sre_mcp.datadog", "--transport", "http", "--port", "8102"]
+    ports: ["127.0.0.1:8102:8102"]
+
+  kibana-mcp:
+    <<: *mcp
+    command: ["python", "-m", "sre_mcp.kibana", "--transport", "http", "--port", "8103"]
+    ports: ["127.0.0.1:8103:8103"]
+
+  gitlab-mcp:
+    <<: *mcp
+    command: ["python", "-m", "sre_mcp.gitlab", "--transport", "http", "--port", "8104"]
+    ports: ["127.0.0.1:8104:8104"]
+
+  agent-api:
+    build: ./agent_api
+    env_file: .env
+    environment:
+      SERVICENOW_MCP_URL: http://servicenow-mcp:8101/mcp
+      DATADOG_MCP_URL: http://datadog-mcp:8102/mcp
+      KIBANA_MCP_URL: http://kibana-mcp:8103/mcp
+      GITLAB_MCP_URL: http://gitlab-mcp:8104/mcp
+      DB_PATH: /data/sre_agent.db
+    volumes:
+      - agent-data:/data
+    depends_on: [servicenow-mcp, datadog-mcp, kibana-mcp, gitlab-mcp]
+    ports: ["127.0.0.1:8080:8080"]
+    restart: unless-stopped
+
+  ui:
+    build: ./ui
+    depends_on: [agent-api]
+    ports: ["3000:8080"]
+    restart: unless-stopped
+
+volumes:
+  agent-data:

@@ -1,0 +1,36 @@
+# Service map: one entry per service the agent can triage.
+# Every MCP server resolves a `service` argument through this file, so the
+# LLM only ever deals in service names, never raw project ids or index patterns.
+services:
+  payments-api:
+    display_name: Payments API
+    snow_ci: payments-api                 # cmdb_ci name in ServiceNow
+    gitlab_project: digital/payments-api  # project path or numeric id
+    gitlab_environment: production
+    kibana_index: "logs-payments-api-*"
+    kibana_service_field: service.name
+    datadog_service: payments-api
+    datadog_env: prod
+    owners: [payments-platform]
+
+  login-service:
+    display_name: Login Service
+    snow_ci: login-service
+    gitlab_project: digital/login-service
+    gitlab_environment: production
+    kibana_index: "logs-login-service-*"
+    kibana_service_field: service.name
+    datadog_service: login-service
+    datadog_env: prod
+    owners: [identity]
+
+  statement-batch:
+    display_name: Statement Batch
+    snow_ci: statement-batch
+    gitlab_project: digital/statement-batch
+    gitlab_environment: production
+    kibana_index: "logs-statement-batch-*"
+    kibana_service_field: service.name
+    datadog_service: statement-batch
+    datadog_env: prod
+    owners: [core-banking-batch]

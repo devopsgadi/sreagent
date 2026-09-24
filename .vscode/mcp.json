@@ -1,0 +1,18 @@
+{
+  // Same MCP servers, used from Copilot Chat (agent mode).
+  // Option 1 (default): the HTTP servers started by `docker compose up` / `make dev`.
+  // Option 2: uncomment the stdio block to have VS Code spawn a server itself.
+  "servers": {
+    "servicenow": { "type": "http", "url": "http://localhost:8101/mcp" },
+    "datadog":    { "type": "http", "url": "http://localhost:8102/mcp" },
+    "kibana":     { "type": "http", "url": "http://localhost:8103/mcp" },
+    "gitlab":     { "type": "http", "url": "http://localhost:8104/mcp" }
+    // "servicenow-local": {
+    //   "type": "stdio",
+    //   "command": "python",
+    //   "args": ["-m", "sre_mcp.servicenow", "--transport", "stdio"],
+    //   "cwd": "${workspaceFolder}/mcp_servers",
+    //   "envFile": "${workspaceFolder}/.env"
+    // }
+  }
+}
