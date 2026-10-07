@@ -5,156 +5,185 @@ __pycache__/
 ui/node_modules/
 ui/dist/
 
-Build a repo called `sre-agent`: an SRE incident-triage agent. MCP servers expose ServiceNow, Datadog,
-Kibana/Elasticsearch and GitLab; a FastAPI agent-api acts as MCP client + LLM tool-calling loop and
-streams progress over SSE to a React UI. The same MCP servers are also used from VS Code Copilot Chat.
-Everything must run in MOCK mode with no credentials. Work in the phases below; after each phase, stop,
-list files created, and give me the command to verify it. Do not skip phases or stub files.
+# Build: MCP triage/debugging agent with the "Anchor" command center UI
 
-## Constraints (apply everywhere)
-- Python 3.11+. Use the official `mcp` Python SDK pinned `mcp>=1.9,<2` (v2 renamed FastMCP; don't use v2 APIs).
-  Server: `from mcp.server.fastmcp import FastMCP`. Client: `from mcp import ClientSession`,
+Build an incident triage and debugging agent in Python 3.11+ on top of five MCP servers (ServiceNow
+plus four others, all from config). It works out why each incident or error happened using an LLM and
+proposes fixes. It must NEVER change anything without my explicit approval.
+
+The web UI has two pages:
+- **Main page**: the incident list plus a daily chart.
+- **Triage page**: the Anchor command center, which opens on its own page for each triage session.
+
+Everything runs on real data: no mock or demo mode at runtime. Mocks are allowed inside tests only.
+
+Work in phases (backend → API/events → UI → tests/docs). After each phase, list the files you changed
+and give me the command to verify it. No stubs or TODOs in code paths.
+
+## 1. Stack and config
+- MCP Python SDK pinned `mcp>=1.9,<2`. Use `from mcp import ClientSession` and
   `from mcp.client.streamable_http import streamablehttp_client`.
-- Also add `constraints.txt` (pip freeze of tested versions) next to each requirements.txt; Dockerfiles use `-c constraints.txt`.
-- No secrets in the repo. `.env` is gitignored; ship `.env.example` with empty values.
-- Tools named `action_*` are WRITE tools. They must never be offered to the LLM, and must refuse to run
-  inside the MCP server unless `ENABLE_ACTIONS=true`.
-- Containers run as non-root. TLS verification on; optional `CA_BUNDLE` env for a corporate CA.
+- All settings come from environment variables or a config file, never hard-coded:
+  - the MCP server list (name, URL, auth token) and the number of servers
+  - poll interval, max iterations per error, LLM provider, base URL, model, API key, timeouts
+  - audit log path, DATABASE_URL, session retention days
+  - LIST_PRIORITIES (default 2,3) and UI_TIMEZONE (default America/Los_Angeles)
+- No secrets in code or logs. TLS verification always on; optional CA_BUNDLE for a corporate CA.
 
-## Phase 1: config + shared MCP code
-- `config/services.yaml`: map of services. Each has display_name, snow_ci, gitlab_project (path or id),
-  gitlab_environment, kibana_index, kibana_service_field, datadog_service, datadog_env, owners.
-  Seed with payments-api, login-service, statement-batch.
-- `.env.example` with: MOCK=true, LLM_PROVIDER=mock (mock|openai|azure|anthropic), MOCK_STEP_DELAY=1.2,
-  LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, AZURE_API_VERSION=2024-10-21, LLM_TIMEOUT=90, LLM_MAX_TOKENS=2000,
-  MCP_AUTH_TOKEN=, AGENT_MAX_STEPS=10, TOOL_RESULT_MAX_CHARS=6000, ENABLE_ACTIONS=false,
-  REQUIRE_USER_HEADER=false, WEBHOOK_SECRET= (empty = webhook disabled), AUTO_TRIAGE_PRIORITIES=1,2,
-  SNOW_URL/SNOW_TOKEN/SNOW_USER/SNOW_PASSWORD, DD_SITE/DD_API_KEY/DD_APP_KEY,
-  ES_URL/ES_API_KEY/ES_USER/ES_PASSWORD/KIBANA_URL/ES_LEVEL_FIELD=log.level/ES_ERROR_TYPE_FIELD=error.type/
-  ES_MESSAGE_FIELD=message, GITLAB_URL/GITLAB_TOKEN, CA_BUNDLE.
-- `mcp_servers/sre_mcp/common.py`:
-  - MOCK flag; ALLOW_WRITES from ENABLE_ACTIONS; `require_writes()` raises PermissionError when off.
-  - `valid_number(n)`: uppercase, must match `^[A-Z]{2,5}\d{4,12}$` (blocks ServiceNow `^OR`/`^NQ` query injection).
-  - `service_map()` (lru_cache, path from SERVICE_MAP_PATH or ../../config/services.yaml) and
-    `resolve_service(name)` matching key, snow_ci, datadog_service or display_name case-insensitively.
-  - `http_client(base_url, headers, auth)` returning httpx.Client with timeout and CA_BUNDLE verify.
-  - `redact(text)`: mask card numbers (regex `\b\d(?:[ -]?\d){12,18}\b` + Luhn check), SSNs, emails,
-    `Bearer <token>`, and `password|secret|api_key|token|authorization` = or : values.
-  - `clean(obj, max_items=50, max_str=800)`: recursive redact + truncate strings and lists with a marker.
-  - `run(mcp, default_port)`: argparse `--transport stdio|http --host --port`. stdio → `mcp.run()`.
-    http → `app = mcp.streamable_http_app()`, wrap in a small ASGI middleware requiring
-    `Authorization: Bearer $MCP_AUTH_TOKEN` (hmac.compare_digest, 401 otherwise) when the token is set,
-    then `uvicorn.run(app, ...)`. Warn if no token and binding non-localhost.
-- `mcp_servers/sre_mcp/mocks.py`: one coherent scenario anchored to "now" (payments-api bad deploy):
-  INC0048213 (P2, payments-api 5xx, opened 25 min ago) + two lower-priority incidents; change CHG0031102;
-  Datadog monitors in Alert/Warn ~28 min ago; error_rate 0.3% → 18.4% after 30 min ago; Kibana signatures
-  ConnectionPoolTimeoutException ×2311 and UpstreamTimeout; sample logs containing a fake card 4111 1111 1111 1111
-  and an example.com email (to prove redaction); error histogram jumping 30 min ago; GitLab deploy v2.18.0
-  31 min ago containing MR !4412 "Tune DB pool for new ledger client" whose diff changes db.pool.maxSize 50 → 10;
-  previous deploy v2.17.3. Other services return empty data.
-Verify: python -c tests of redact() and resolve_service().
+## 2. Tool safety (before any tool call)
+- On startup, list each server's tools and build an allowlist from their names and descriptions:
+  read-only tools for incidents, logs, stack traces and metrics only.
+- Write or mutating tools (for example action_*, delete, restart, exec, patch) are never called
+  automatically. They may only run as part of a fix I have approved.
+- Do not call a tool unless its purpose and its "must not do" limits are known from its description.
+- Add a read-only ServiceNow MCP tool `incident_counts(date, group_by=priority|service|assignment_group|state)`.
+  It uses the ServiceNow Aggregate API (`/api/now/stats/incident`), counting incidents opened on that
+  date in UI_TIMEZONE.
 
-## Phase 2: the four MCP servers (each `FastMCP(name, stateless_http=True)`, every tool takes `service`
-and resolves via resolve_service, returns clean(...), has a mock branch, and a clear docstring for the LLM)
-- `servicenow.py` (port 8101), Table API with sysparm_display_value=true, bearer or basic auth:
-  get_incident(number) incl. mapped `service`; list_open_incidents(max_priority=3, limit=25, capped 100);
-  list_changes(service, hours=24) on cmdb_ci.name + gs.hoursAgoStart; related_incidents(service, days=14);
-  action_add_work_note(number, note): require_writes(), valid_number, PATCH work_notes.
-- `datadog.py` (8102), headers DD-API-KEY/DD-APPLICATION-KEY: get_active_monitors(service) (Alert/Warn/No Data);
-  query_metric(service, metric, minutes=120) using NAMED templates only (error_rate, request_rate,
-  latency_p95, pod_restarts, cpu, memory) returning ≤30 points + min/max/last/baseline(first quarter avg);
-  get_events(service, minutes=240).
-- `kibana.py` (8103), query Elasticsearch `_search` directly (ApiKey or basic): top_error_signatures
-  (terms agg on error type with first/last seen + 1 sample, plus a Kibana Discover URL);
-  search_errors(service, minutes, query=None, limit≤50, minutes ≤1440) where query_string is capped to 200
-  chars with allow_leading_wildcard=false; error_histogram(service, minutes, interval) returning buckets and
-  `estimated_onset` (first bucket > max(10, 5× median)). Never return raw hit dumps.
-- `gitlab.py` (8104), PRIVATE-TOKEN, project path URL-encoded: list_deployments(service, hours) with the MRs
-  in each deploy (commits/:sha/merge_requests); get_merge_request_changes(service, mr_iid) (diffs, fallback
-  /changes, max_str 1500); list_failed_pipelines; compare_refs (refs must match `^[A-Za-z0-9._/-]{1,100}$`);
-  action_create_rollback_mr(service, mr_iid, reason): require_writes(), create branch from default,
-  revert merge/squash commit onto it, open a "Draft: Revert !iid" MR. Never merge.
-- `mcp_servers/Dockerfile` (python:3.12-slim, USER 10001, SERVICE_MAP_PATH=/config/services.yaml).
-Verify: run each with `python -m sre_mcp.<name> --transport http --port <p>` and MOCK=true.
+## 3. Sessions (one triage = one session)
+- A session is one triage of one incident (or one detected MCP error). It has:
+  `session_id`, `incident`, `started_by` (identity header), `trigger` (user|poller|webhook),
+  `status` (queued|running|awaiting_approval|resolved|unresolved|failed|iteration_limit_hit),
+  `created_at`, `updated_at`, `iteration`.
+- Sessions, their events and their approvals are stored in Postgres (SQLite allowed for local dev only).
+  Each session has its own event sequence.
+- "Run triage" on an incident:
+  - Creates a new session, unless one is already running for that incident. In that case it returns
+    409 with the existing `session_id`, and the UI opens that session instead.
+  - "Run again" creates a new session linked to the previous one (`parent_session_id`).
+- Sessions survive refreshes, pod restarts and reconnects:
+  - The UI resumes by replaying stored events, then streaming live ones (SSE with Last-Event-ID).
+  - Several people can watch the same session at once.
+  - A session left in `running` with no events for 15 minutes is marked failed ("interrupted").
+- An approval belongs to its session: approve or reject only works on that session's current proposal,
+  and only by a named user.
+- Retention: purge sessions and events older than the configured number of days. The audit log is
+  never purged.
 
-## Phase 3: agent-api (FastAPI)
-- `app/config.py`: all env above; MCP URLs SERVICENOW_MCP_URL etc. defaulting to http://localhost:810x/mcp.
-- `app/mcp_hub.py`: async context manager connecting to all servers via AsyncExitStack (send the bearer
-  token if MCP_AUTH_TOKEN set); unreachable servers are recorded, not fatal. `llm_tools()` returns
-  OpenAI function schemas named `<server>__<tool>`, EXCLUDING action_* tools. `call(name, args,
-  allow_actions=False)` returns (server, tool, ok, text, duration_ms), refusing action_* unless allowed;
-  prefer structuredContent (unwrap {"result": ...}) else text content.
-- `app/llm.py`: internal OpenAI-style messages. Providers: openai-compatible ({base}/chat/completions,
-  Bearer), azure ({base}/openai/deployments/{model}/chat/completions?api-version, api-key header),
-  anthropic ({base}/v1/messages; convert system, tool_use, tool_result blocks), and mock.
-  Mock: sleeps MOCK_STEP_DELAY, then plays the playbook as parallel tool-call batches based on how many
-  tool rounds happened: [get_incident] → [get_active_monitors, query_metric error_rate] →
-  [error_histogram, top_error_signatures] → [list_deployments, list_changes] → [get_merge_request_changes
-  if a deploy had an MR]; then returns an RCA JSON built from the actual tool results (high confidence if
-  deploy + error signature + MR found, else low).
-- `app/prompts.py`: system prompt with that playbook, "only state facts from tool results", confidence rules,
-  and a strict JSON output contract: summary, probable_cause, confidence (high|medium|low), service,
-  timeline[{time, source, event}], evidence[{source, finding, ref}], recommended_actions[{type
-  rollback|work_note|investigate|scale|other, action, details, mr_iid?, service?}], open_questions[].
-- `app/store.py`: SQLite (runs, events, audit), parameterized SQL, thread lock. `emit(run_id, type, data)`
-  persists with a per-run seq (reload MAX(seq) after restart) and pushes to in-memory subscriber queues.
-- `app/agent.py`: run_triage emits run_started, sources, llm_step, agent_note, tool_started, tool_finished
-  (with preview + truncated result), rca_ready, run_finished / run_failed. Tool calls in a round run with
-  asyncio.gather. After AGENT_MAX_STEPS force a final answer without tools. Parse RCA JSON (strip fences,
-  fill defaults); retry once if invalid.
-- `app/main.py` routes: GET /api/health, /api/sources (no internal URLs or error text), /api/incidents
-  (ServiceNow list + latest run per incident), POST /api/triage {incident matching ^[A-Za-z]{2,5}\d{4,12}$},
-  GET /api/runs, /api/runs/{id}, /api/runs/{id}/events (SSE: replay stored events honoring Last-Event-ID,
-  then live, keepalive every 15s, stop at terminal event, header X-Accel-Buffering: no),
-  POST /api/runs/{id}/actions {action: post_work_note|draft_rollback_mr, confirm: true},
-  GET /api/audit, POST /api/webhooks/servicenow.
-  Security rules: identity ONLY from X-Forwarded-User (no other header); write actions ALWAYS require a
-  named user even if REQUIRE_USER_HEADER=false; actions need ENABLE_ACTIONS=true and confirm=true and are
-  written to the audit table. For rollback, the mr_iid from the RCA must appear in a GitLab tool result
-  from the same run, otherwise 400. Webhook requires X-Webhook-Secret (compare_digest; empty secret =
-  disabled), validates the number pattern, and triggers only for AUTO_TRIAGE_PRIORITIES.
-- `agent_api/Dockerfile` (non-root, /data volume), `tests/test_agent.py` with pytest-asyncio
-  (RCA parsing, redaction, truncation, service aliases, mock LLM plays the playbook).
-Verify: start the 4 servers + `uvicorn app.main:app --port 8080`, POST /api/triage for INC0048213,
-curl the SSE stream, confirm status triaged with high confidence.
+## 4. Feedback loop inside a session (one clear goal per session)
+1. **Detect**: the incident is the starting point, or the poller finds an MCP server error. Fingerprint
+   errors (server + error type + normalised message) so duplicates are grouped rather than re-triaged.
+2. **Gather context**: pull related logs, stack traces and metrics around the timestamp. Never send full
+   logs to the LLM. Keep only the relevant stack frames, the log lines near the error, and metric anomalies.
+   Redact secrets, tokens, emails and card/account numbers. Cap the size of the context.
+3. **Analyse**: send the summary to the LLM and require strict JSON:
+   `{root_cause, evidence[{source, finding}], proposed_fix, affected_resources[], risk,
+   confidence: high|medium|low, verification_steps[], source_verdicts[{source, component,
+   status: ok|suspect|fault}]}`.
+   Validate the JSON and retry once if it is invalid.
+4. **Propose**: set the session to awaiting_approval. Apply nothing before approval.
+5. **Verify**: after an approved fix is applied, re-check the affected server using the
+   verification_steps. If the error is resolved, close the session. If not, go back to step 2 with
+   the new evidence.
+- Decide how deep to go and stop when the root cause is confirmed or the evidence runs out.
+- Enforce a maximum number of iterations per session. When the limit is hit, set the status to
+  iteration_limit_hit and report what was tried, the evidence, and open questions.
 
-## Phase 4: React UI (Vite, plain JS, no UI framework)
-- Layout: top bar (brand, per-source health dots, "Demo mode" when mock); left rail of open incidents
-  (priority chip, number, description, status "Not triaged / Triaging / Triaged, high confidence", age);
-  main area: incident header + "Run triage / Run again" button + elapsed time; thin progress bar;
-  four source lanes (ServiceNow, Datadog, Kibana, GitLab) showing Queued/Connected/Querying/Reported/
-  Failed/Unreachable/Not needed and query counts; a correlated timeline with one swimlane per source,
-  numbered markers positioned by time, axis ticks, and a numbered list below; then two columns: agent
-  activity feed (source, tool(args), duration, one-line preview, click to expand pretty JSON) and the RCA
-  panel (confidence badge, summary, probable cause, evidence with https-only links, recommended steps,
-  open questions, buttons "Post RCA to ServiceNow" and "Draft rollback MR (!iid)").
-- Actions open a native <dialog> confirm that names the exact target (incident, or MR !iid in service),
-  says it is audit-logged, then POSTs; show the result or the API error inline.
-- `hooks/useTriageStream.js`: EventSource with a listener per event type feeding a reducer; close on
-  run_finished/run_failed. Selecting an incident with a previous run replays that run.
-- Visual direction: "control room". Cool paper background, white panels, ink navy text, one steel-blue
-  accent; each source keeps a fixed colour everywhere (servicenow green, datadog violet, kibana teal,
-  gitlab burnt orange). IBM Plex Sans for UI, IBM Plex Mono only for tool calls/ids/times. 24h times.
-  Dark mode via prefers-color-scheme. Only ambient motion: a pulse on running lanes; respect
-  prefers-reduced-motion. Responsive: rail stacks on top under 860px, lanes go 2×2.
-- `vite.config.js` proxies /api to API_URL or localhost:8080. `nginx.conf` for the container:
-  serves the SPA, proxies /api to agent-api:8080 with proxy_buffering off and 1h read timeout for SSE,
-  and OVERWRITES identity: `proxy_set_header X-Forwarded-User "";` with a commented oauth2-proxy
-  auth_request block that sets it from $upstream_http_x_auth_request_user. Multi-stage Dockerfile to
-  nginx-unprivileged on 8080.
-Verify: npm run dev, run triage on INC0048213, watch lanes/feed update live, confirm dialog shows !4412.
+## 5. Events, API and audit
+- Every step emits a persisted event with a per-session sequence number:
+  - session_started, context_gathering, tool_started, tool_finished (one-line preview), agent_note,
+    hypothesis {stage, text}
+  - fix_proposed, awaiting_approval, approved, rejected, fix_applied, verifying
+  - resolved | unresolved | iteration_limit_hit | session_failed
+- FastAPI endpoints:
+  - `GET /api/incidents?priorities=2,3`: open incidents, each with its latest session
+    (id, status, confidence).
+  - `GET /api/incidents/stats?date=YYYY-MM-DD&group_by=priority`: slices of {label, count} plus a total.
+  - `POST /api/sessions {incident}`: returns 201 with session_id, or 409 with the existing session_id.
+  - `GET /api/sessions?mine=true&incident=…`, `GET /api/sessions/{id}`.
+  - `GET /api/sessions/{id}/events`: SSE with Last-Event-ID replay, 15s keepalive and
+    `X-Accel-Buffering: no`.
+  - `POST /api/sessions/{id}/approve` and `/reject`: require a named user and `confirm: true`.
+  - `GET /api/sources`: health only.
+- Append-only JSONL audit, keyed by session_id, of:
+  - every MCP tool call (server, tool, redacted args, duration, status)
+  - every LLM request and response
+  - every approval or rejection (who and when)
 
-## Phase 5: wiring, VS Code, docs
-- `docker-compose.yml`: 4 MCP services from one image (different module commands), agent-api, ui.
-  ALL ports bound to 127.0.0.1 (UI on 127.0.0.1:3000). env_file .env. config mounted read-only.
-- `.vscode/mcp.json`: the 4 HTTP servers with `Authorization: Bearer ${input:mcp_token}` and a password
-  promptString input.
-- `AGENTS.md` (rules: never call action_* without approval; use service names) and
-  `.agents/skills/sre-triage/SKILL.md` (frontmatter name/description + the same playbook and output order).
-- `Makefile` (up, down, logs, install, dev, test, smoke), `scripts/dev.sh` (start everything locally, kill all
-  on Ctrl+C), `scripts/smoke.sh` (health, sources, triage INC0048213, print event types and final RCA summary;
-  use heredoc'd python, no nested-quote f-strings), `.gitignore` (.env, .venv, *.db, node_modules, dist).
-- `README.md` (architecture diagram, quick start, going live checklist) and `docs/configuration.md`,
-  `docs/security.md` (read-only agent, gated writes, redaction, identity, MCP token, input validation,
-  pinned deps, production notes), `docs/extending.md` (add a tool, add Kubernetes/Azure as a source).
-Verify: `docker compose up --build`, open http://localhost:3000, triage INC0048213; `make test`; `make smoke`.
+## 6. UI: React + Vite + React Router, two routes
+### Route `/` (main page)
+- **Header**: the ANCHOR wordmark, one health dot per MCP server, and the LLM provider name.
+- **Left: incident table** (P2 and P3 by default, from LIST_PRIORITIES), with priority filter chips
+  (P1–P4) and a search box. Columns:
+  - priority chip, INC number (mono), short description, service
+  - assignment group, state, age
+  - triage status (Not triaged / Triaging / Awaiting approval / Triaged, high confidence / …)
+  - a **"Run triage"** button next to each row, which reads "Open session" if a session is already
+    running and "Run again" if a finished one exists
+  - Run triage → POST /api/sessions → navigate to `/triage/:sessionId`. On 409, navigate to the
+    existing session.
+  - Ctrl/Cmd-click or middle-click opens the session in a new browser tab (use real links).
+- **Right: "Incidents on <date>" pie chart (donut)**:
+  - A date picker that defaults to today in UI_TIMEZONE.
+  - A group-by toggle: Priority (default) / Service / Assignment group / State.
+  - The total in the centre, a legend with counts and percentages, and a priority colour scale (P1 red,
+    P2 orange, P3 amber, P4 grey).
+  - Clicking a slice filters the incident table; a table fallback is provided for screen readers.
+  - Built only from `/api/incidents/stats` (no client-side guessing); "No incidents on this date" when
+    there are none.
+- **"My sessions" strip**: my recent sessions with status and a link to each.
+- The list refreshes every 60s, and the page keeps the selected filters and date in the URL query.
+
+### Route `/triage/:sessionId` (Anchor command center, its own page)
+- A breadcrumb "← Incidents" (returns to `/` with the previous filters), plus "INC… · session <short id>
+  · started by <user> <time>", and links to any previous or next sessions for the same incident.
+- **Header**:
+  - A breathing accent dot and the ANCHOR wordmark.
+  - A meta line "<n> MCP servers · <n> reachable".
+  - An "ask anchor" input: an INC number starts or opens its session.
+  - Play/Pause and Replay buttons for finished sessions.
+- **Left column**:
+  - **Live header**: "● LIVE · <INC> · P<n>", the short description as the h1, and the clock
+    "T+Ns · n tool calls in flight".
+  - **Orbit**: a core with 3 rotating rings and a state line (`reasoning` | `calling` | `n tools live` |
+    `awaiting you`). One node per MCP server is placed on a circle from config. Beam states:
+    - idle: dashed and dim.
+    - calling: animated dash in the source colour, and the caption shows `tool()`.
+    - returned: solid and faded, and the caption shows the preview.
+    - failed: red.
+  - **"ANCHOR IS THINKING"**: the latest agent_note in large text plus the last 3 feed lines,
+    `aria-live="polite"`.
+- **Right column**:
+  - **Confidence ring**: high/medium/low maps to 100/66/33%, labelled FORMING → NARROWING → STRONG →
+    ROOT CAUSE. No fake percentages.
+  - **Live path**: hops from source_verdicts, each one `not checked` | `probing…` | `ok` | `suspect` |
+    `fault`.
+  - **Fix card**: the proposed fix, risk and verification steps. "Approve fix" opens a native `<dialog>`
+    that names the exact target and says the action is audit-logged, then POSTs. Show the result inline.
+    Render the error-rate chart only from real metric data.
+- **Time machine**: a slider over the session's stored events. Scrubbing replays the reducer over
+  `events.slice(0, i+1)`, with ticks at started, first tool returned, fix proposed, and verified.
+- The page title is "<INC> · <status> · Anchor".
+
+### Shared UI rules
+- One reducer per session over the event stream feeds every panel.
+- **Tokens**:
+  - Background #07090D with a 48px #0E131B grid; panels rgba(10,14,20,.85) with a #161D28 border and
+    radius 16.
+  - Text #D9E1EA / #F4F8FC / muted #6B7686. Accent #7FD4FF; ok #8FE3A5, suspect #F2C27A, fault #FF8F8F.
+  - Fixed source colours defined once in a single map.
+  - Self-hosted Space Grotesk and JetBrains Mono (mono for INC numbers, tools, ids and times), 24-hour
+    times.
+- **Motion and accessibility**:
+  - Animate only live state; `prefers-reduced-motion` turns animation off.
+  - Under 860px the columns stack, the table scrolls inside its box, the pie chart moves under the table,
+    and the orbit scales.
+  - Real buttons, links, labels and inputs; contrast ≥4.5:1; touch targets ≥44px; no emoji.
+
+## 7. Deliverables
+- Backend modules:
+  - config, mcp_client, poller, context_summarizer, redact, llm_client
+  - sessions (model, store, retention), state_machine, approval, events_store, audit, api
+- UI:
+  - pages: IncidentsPage, TriagePage
+  - components: IncidentTable, IncidentsPie, MySessions, CommandHeader, LiveHeader, Orbit,
+    ThoughtStream, ConfidenceCard, LivePath, FixCard, TimeMachine
+  - hooks: useSessionStream, useIncidentStats
+  - theme.css
+- Tests:
+  - redaction, the tool allowlist, JSON parsing and retry, the iteration limit
+  - sessions: create, 409 reuse, resume after restart, interrupted-session cleanup, retention purge
+  - stats endpoint date and timezone boundaries
+  - the approval gate (anonymous user rejected, wrong session rejected, write never runs before approval)
+  - SSE replay
+- README covering setup, environment variables, run commands, the session lifecycle and the approval flow.
