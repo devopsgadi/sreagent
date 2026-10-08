@@ -436,3 +436,101 @@ Strip code fences, fill defaults, and retry once if the JSON is invalid.
 7. Helm chart, GitLab CI, VS Code files and scripts (G), plus docs: README with architecture, local dev,
    deploy and go-live checklist; configuration, security, kubernetes and extending guides.
 8. Evaluation harness.
+
+## J. Skills: one knowledge source, used three ways
+The repo ships skill folders (Agent Skills format: SKILL.md with name/description frontmatter, plus
+`references/`). The first is `kibana-k8s-triage` (SKILL.md, references/field-mapping.md,
+references/envoy-response-flags.md, references/es-dsl.md) with a companion `references/gitlab-api.md`.
+Copy them unchanged into `.agents/skills/kibana-k8s-triage/`. They are the single source of truth for
+the triage method; code and prompts are generated from them, not re-typed.
+
+### J.1 Rules mode: turn the skill into code and config
+- `config/response_flags.yaml`, generated from envoy-response-flags.md:
+  - Every flag (NR, UH, UF, UC, URX, UT, UO, UR, LR, DC, DI, FI, RL, RLSE, UAEX, NC, DT, DPE, UPE, UMSDR,
+    OM, and "-") with its meaning and a `next_check`:
+    hop_downstream | pods | route_config | mtls | circuit_breaker | client_side | authz | protocol |
+    proxy_resources.
+  - Special cases: `response_code 0` means a connection-level failure; 403 with `RBAC` in
+    response_code_details means an AuthorizationPolicy denied it, not the app.
+- The skill's Step 3 code+flag table becomes blame rules, e.g. 502+UF/UC/URX → sidecar to app;
+  502+"-" → app or dependency; 503+UH → pods; 503+UO → circuit breaker; 504+UT → slow app or VS timeout;
+  404+NR → VirtualService; 404+"-" → app path.
+- The skill's Step 2 "last hop that logged" table becomes the trace_lookup verdict: gateway only →
+  routing/endpoints/mTLS; inbound sidecar only → app down or wrong port; app container → check its
+  errors and outbound calls; outbound 5xx → dependency (named from upstream_cluster/authority).
+- Time window: ±15 min around the incident time, widened to ±2 h when nothing is found or the ticket was
+  raised well after the impact. State the timezone conversion to UTC in the evidence pack.
+- Always filter by app labels, never by a single pod name, so logs of replaced pods are included.
+
+### J.2 kibana MCP: implement the skill's queries as tools (DSL from es-dsl.md)
+- `discover_fields(index, namespace)` (Step 0):
+  - Fetch one recent doc and map the placeholders {ns}, {app}, {pod}, {container}, {image}, {level},
+    {msg} and the Envoy fields, using the variants in field-mapping.md (ECS, Fluent Bit, Fluentd, OTel).
+  - Detect whether Istio access logs are JSON or TEXT.
+  - Cache per index pattern; config overrides win.
+  - When access logs are text only, use the positional text fallbacks and add the data gap
+    "ingest pipeline needed".
+- `gateway_errors(service, minutes)` (Step 1): counts by response_code × response_flags, top paths,
+  first/last seen and 3 sample x_request_ids. With no service, aggregate by upstream_cluster to find
+  the failing one.
+- `trace_lookup` (Step 2): ±1 h around the request time.
+- `sidecar_inbound_errors(service, minutes)` (Step 3).
+- `istio_outbound_failures` (Step 4): marks cross-namespace dependencies, which become hop pointers.
+- `config_secret_signatures(service, minutes)` (Step 5): Spring Boot signatures such as `Could not
+  resolve placeholder`, `BeanCreationException`, `APPLICATION FAILED TO START`, secret/keyvault/
+  credential, Unauthorized/Forbidden.
+- `k8s_warning_events(service, minutes)` (Step 5): from the events index if one is shipped, with the
+  reasons CreateContainerConfigError, FailedMount, BackOff, OOMKilling, Unhealthy. Without an events
+  index, return the data gap "K8s events not shipped".
+- `pod_lifecycle(service, minutes)` (Step 6, ALWAYS run in rules mode):
+  - Per pod: image tag, first and last timestamps.
+  - Flags pods that died inside the window, and image-tag changes just before onset.
+  - Returns the last ~50 app lines of each dead pod.
+- `sanity_checks(service, minutes)` (Step 7): other apps have logs in the window, retention, app-label
+  fallback `{pod}: APP-*`, istio-proxy access logging present. Each failure becomes a data gap.
+- Edge: when the gateway shows no errors but users see 502/504, hop to F5/NGINX Plus logs and record
+  "failure upstream of Istio gateway".
+
+### J.3 gitlab MCP: implement from gitlab-api.md
+- Use the read-only endpoints listed there:
+  - deployments in a window, pipelines and failed jobs, job trace (tail only, redacted)
+  - compare, commits by path, commit → MRs, merged MRs in a window, MR diffs and approvals, tags
+- `image_tag_to_commit(service, tag)`: try a short SHA first, then a pipeline id, then the build job trace
+  (`docker push`, `crane push`, `IMAGE_TAG=`), then registry tag created_at. This connects pod_lifecycle
+  tag changes to MRs.
+- `variable_names(service)`: returns names only. Strip `value` before storing, logging or returning.
+- A read_api token is enough for every read tool. Never call retry, play, merge or variables write
+  endpoints. The only write remains the gated action_create_rollback_mr, using a separate token
+  scoped to it.
+
+### J.4 Hybrid, agent and Copilot modes: load skills on demand
+- Copilot mode: VS Code Copilot discovers skills from the configured skills location. Keep them in
+  `.agents/skills/` and set the VS Code agent-skills location setting, or mirror to `.github/skills/`
+  if this Copilot version only reads that path. AGENTS.md says to use the kibana-k8s-triage skill for
+  any gateway error, 5xx/4xx, Envoy flag, x-request-id, pod restart or secret issue.
+- Server-side LLM (hybrid assists and agent mode), with progressive disclosure:
+  - The system prompt lists only each skill's name and description (about 100 tokens per skill).
+  - The LLM may call an internal tool `read_skill(name, file?)` that returns SKILL.md or one reference
+    file, cached per session.
+  - Never paste every skill into every call. A full SKILL.md is about 2.5k tokens and each reference
+    about 1–1.5k; this usage is counted in token accounting as call_type `skill_load`.
+- The skill's output format (Symptom, Failing hop, Evidence, Pods/deploy, Likely cause + Confidence, Gaps,
+  Next checks) maps onto the RCA contract: failing hop → hops/origin_service, gaps → data_gaps, next
+  checks → recommended_actions of type investigate (read-only commands only).
+
+### J.5 Keeping them in sync
+- A CI test parses envoy-response-flags.md and fails if config/response_flags.yaml is missing a flag.
+- A CI test checks every Step in SKILL.md has a matching kibana tool or rule, using a mapping table in
+  `docs/skills-mapping.md`.
+- Adding a skill = add the folder, plus its tools or rules if it is meant for rules mode.
+  Documented in docs/extending.md.
+
+### J.6 Tests
+- Field discovery for each variant in field-mapping.md (ECS, Fluent Bit, Fluentd, OTel, Istio JSON and
+  text), using mocked documents.
+- Parsing the text access-log positional format.
+- Every code+flag rule from Step 3 and every row of the Step 2 trace table.
+- pod_lifecycle dead-pod and tag-change detection.
+- image_tag_to_commit across all three strategies.
+- Variable values never returned.
+- read_skill progressive loading and token accounting.
